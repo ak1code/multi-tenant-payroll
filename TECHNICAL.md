@@ -66,8 +66,10 @@ Supervisor scoping uses **denormalized `supervisorId`** on `DisbursementRecord` 
 
 1. Compute **SHA-256** hash of raw CSV file bytes
 2. Store hash on `Batch.fileHash` with a **unique MongoDB index**
-3. Duplicate upload → MongoDB E11000 → API returns **409 Conflict**
+3. Duplicate upload → MongoDB E11000 → API returns **409 Conflict** — no rows are parsed, no jobs enqueued, and no disbursements run (duplicate **processing** prevented, not just duplicate batch storage)
 4. Concurrent duplicate uploads race on the unique index — only one batch is created
+5. **Within-file dedup:** duplicate `employeeId + payPeriod` in the same CSV are marked `INVALID` and never queued
+6. **Cross-file dedup:** the same `tenantId + employeeId + payPeriod` is rejected when a prior disbursement is `SUCCEEDED` or in-flight (`PENDING` / `PROCESSING` / `RETRYING`). Rows are marked `INVALID` with a clear reason — no second queue job or disbursement call. Retries are allowed after `DEAD_LETTER` or `INVALID` (e.g. admin uploads a corrected file). A **partial unique MongoDB index** on `{ tenantId, employeeId, payPeriod }` for active/success statuses prevents race duplicates when two different files are uploaded concurrently
 
 ## 7. Indexing Decisions
 
@@ -82,6 +84,7 @@ Supervisor scoping uses **denormalized `supervisorId`** on `DisbursementRecord` 
 | `{ tenantId, employeeName }` text | DisbursementRecord | Partial name search |
 | `{ supervisorId, tenantId }` | DisbursementRecord | Supervisor scope filter |
 | `{ batchId }` | DisbursementRecord | Batch status aggregation |
+| `{ tenantId, employeeId, payPeriod }` unique (partial: active/success statuses) | DisbursementRecord | Cross-file disbursement dedup + race safety |
 
 ## 8. Pagination Choice
 

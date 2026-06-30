@@ -105,6 +105,72 @@ describe('Upload flow (e2e)', () => {
     expect(second.body.message).toContain('Duplicate upload');
   });
 
+  it('cross-file duplicate employeeId + payPeriod → INVALID, not double disbursed', async () => {
+    const payPeriod = '2025-12';
+    const firstCsv = Buffer.from(`employeeId,amount,payPeriod\nEMP011,5000,${payPeriod}\n`);
+    const secondCsv = Buffer.from(`employeeId,amount,payPeriod\nEMP011,7000,${payPeriod}\n`);
+
+    const firstUpload = await request(app.getHttpServer())
+      .post('/payroll/upload')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .attach('file', firstCsv, `cross-file-first-${Date.now()}.csv`);
+
+    expect(firstUpload.status).toBe(202);
+    const firstBatchId = firstUpload.body.batchId;
+
+    let firstSucceeded = false;
+    for (let i = 0; i < 90; i++) {
+      const statusRes = await request(app.getHttpServer())
+        .get(`/payroll/batch/${firstBatchId}/status`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      if (statusRes.body.succeeded >= 1) {
+        firstSucceeded = true;
+        break;
+      }
+
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(firstSucceeded).toBe(true);
+
+    const secondUpload = await request(app.getHttpServer())
+      .post('/payroll/upload')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .attach('file', secondCsv, `cross-file-second-${Date.now()}.csv`);
+
+    expect(secondUpload.status).toBe(202);
+    const secondBatchId = secondUpload.body.batchId;
+
+    let secondSettled = false;
+    for (let i = 0; i < 90; i++) {
+      const statusRes = await request(app.getHttpServer())
+        .get(`/payroll/batch/${secondBatchId}/status`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      if (statusRes.body.status === 'COMPLETED' || statusRes.body.status === 'PARTIALLY_FAILED') {
+        expect(statusRes.body.invalid).toBeGreaterThanOrEqual(1);
+        expect(statusRes.body.succeeded).toBe(0);
+        secondSettled = true;
+        break;
+      }
+
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(secondSettled).toBe(true);
+
+    const searchRes = await request(app.getHttpServer())
+      .get('/payroll/search')
+      .query({ status: 'SUCCEEDED', payPeriod })
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(searchRes.status).toBe(200);
+    const succeededForPeriod = searchRes.body.data.filter(
+      (r: { employeeId: string; payPeriod: string }) =>
+        r.employeeId === 'EMP011' && r.payPeriod === payPeriod,
+    );
+    expect(succeededForPeriod).toHaveLength(1);
+  }, 180000);
+
   it('invalid rows do not block valid rows from processing', async () => {
     const mixedCsv = Buffer.from(
       'employeeId,amount,payPeriod\n' +

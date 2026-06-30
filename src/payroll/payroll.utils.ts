@@ -10,6 +10,10 @@ export interface RowValidationContext {
   tenantId: string;
   seenKeys: Set<string>;
   employeeExists: (employeeId: string) => Promise<boolean>;
+  hasActiveOrSucceededDisbursement: (
+    employeeId: string,
+    payPeriod: string,
+  ) => Promise<boolean>;
   getEmployee?: (employeeId: string) => Promise<{
     _id: { toString: () => string };
     name: string;
@@ -29,6 +33,9 @@ export interface RowValidationResult {
 }
 
 export { isValidPayPeriod };
+
+export const CROSS_FILE_DUPLICATE_REASON =
+  'Disbursement already exists for this employee and pay period';
 
 export async function validateRow(
   row: CsvRow,
@@ -68,6 +75,14 @@ export async function validateRow(
   const exists = await context.employeeExists(employeeId);
   if (!exists) {
     return { valid: false, reason: 'Employee not found' };
+  }
+
+  const alreadyDisbursing = await context.hasActiveOrSucceededDisbursement(
+    employeeId,
+    parsedPayPeriod.canonical,
+  );
+  if (alreadyDisbursing) {
+    return { valid: false, reason: CROSS_FILE_DUPLICATE_REASON };
   }
 
   context.seenKeys.add(duplicateKey);

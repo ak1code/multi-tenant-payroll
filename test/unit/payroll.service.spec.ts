@@ -1,4 +1,4 @@
-import { validateRow, isValidPayPeriod, computeBatchStatus, shouldDeadLetter } from '../../src/payroll/payroll.utils';
+import { validateRow, isValidPayPeriod, computeBatchStatus, shouldDeadLetter, CROSS_FILE_DUPLICATE_REASON } from '../../src/payroll/payroll.utils';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getModelToken } from '@nestjs/mongoose';
 import { getQueueToken } from '@nestjs/bullmq';
@@ -15,6 +15,7 @@ describe('validateRow', () => {
     tenantId: 'tenant1',
     seenKeys: new Set<string>(),
     employeeExists: async (id: string) => id.startsWith('EMP'),
+    hasActiveOrSucceededDisbursement: async () => false,
   };
 
   beforeEach(() => {
@@ -97,6 +98,20 @@ describe('validateRow', () => {
     );
     expect(result.valid).toBe(false);
     expect(result.reason).toBe('Duplicate row in batch');
+  });
+
+  it('cross-file duplicate employeeId + payPeriod → INVALID', async () => {
+    const result = await validateRow(
+      { employeeId: 'EMP001', amount: '5000', payPeriod: '2025-7' },
+      {
+        ...baseContext,
+        seenKeys: new Set<string>(),
+        hasActiveOrSucceededDisbursement: async (employeeId, payPeriod) =>
+          employeeId === 'EMP001' && payPeriod === '2025-7',
+      },
+    );
+    expect(result.valid).toBe(false);
+    expect(result.reason).toBe(CROSS_FILE_DUPLICATE_REASON);
   });
 });
 

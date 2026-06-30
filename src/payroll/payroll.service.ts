@@ -22,10 +22,12 @@ import {
   DisbursementStatus,
   PAYROLL_QUEUE,
   UserRole,
+  ACTIVE_DISBURSEMENT_STATUSES,
 } from '../common/constants';
 import {
   CsvRow,
   computeBatchStatus,
+  CROSS_FILE_DUPLICATE_REASON,
   isDuplicateKeyError,
   validateRow,
 } from './payroll.utils';
@@ -248,6 +250,15 @@ export class PayrollService {
           const employee = await this.employeesService.findByEmployeeId(tenantId, employeeId);
           return employee !== null;
         },
+        hasActiveOrSucceededDisbursement: async (employeeId, payPeriod) => {
+          const existing = await this.disbursementModel.exists({
+            tenantId: new Types.ObjectId(tenantId),
+            employeeId,
+            payPeriod,
+            status: { $in: [...ACTIVE_DISBURSEMENT_STATUSES] },
+          });
+          return existing !== null;
+        },
       });
 
       if (!validation.valid) {
@@ -282,22 +293,15 @@ export class PayrollService {
         continue;
       }
 
-      const record = await this.disbursementModel.create({
-        batchId: new Types.ObjectId(batchId),
-        tenantId: new Types.ObjectId(tenantId),
-        employeeId: parsed.employeeId,
-        employeeDbId: employee._id,
-        employeeName: employee.name,
-        supervisorId: employee.supervisorId,
-        amount: parsed.amount,
-        payPeriod: parsed.payPeriod,
-        payPeriodSort: parsed.payPeriodSort,
-        status: DisbursementStatus.PENDING,
-        invalidReason: null,
-        attempts: 0,
-        lastAttemptAt: null,
-        processedAt: null,
+      const record = await this.createPendingDisbursementRecord({
+        batchId,
+        tenantId,
+        parsed,
+        employee,
       });
+      if (!record) {
+        continue;
+      }
 
       const maxAttempts = this.configService.get<number>('bull.maxAttempts') ?? 5;
       const backoffDelay = this.configService.get<number>('bull.backoffDelay') ?? 2000;
@@ -327,6 +331,60 @@ export class PayrollService {
       await this.batchModel.findByIdAndUpdate(batchId, { $inc: { pending: pendingCount } }).exec();
     } else {
       await this.recomputeBatchStatus(batchId);
+    }
+  }
+
+  private async createPendingDisbursementRecord(params: {
+    batchId: string;
+    tenantId: string;
+    parsed: {
+      employeeId: string;
+      amount: number;
+      payPeriod: string;
+      payPeriodSort: number;
+    };
+    employee: {
+      _id: Types.ObjectId;
+      name: string;
+      supervisorId: Types.ObjectId;
+    };
+  }): Promise<DisbursementRecordDocument | null> {
+    const { batchId, tenantId, parsed, employee } = params;
+
+    try {
+      return await this.disbursementModel.create({
+        batchId: new Types.ObjectId(batchId),
+        tenantId: new Types.ObjectId(tenantId),
+        employeeId: parsed.employeeId,
+        employeeDbId: employee._id,
+        employeeName: employee.name,
+        supervisorId: employee.supervisorId,
+        amount: parsed.amount,
+        payPeriod: parsed.payPeriod,
+        payPeriodSort: parsed.payPeriodSort,
+        status: DisbursementStatus.PENDING,
+        invalidReason: null,
+        attempts: 0,
+        lastAttemptAt: null,
+        processedAt: null,
+      });
+    } catch (error) {
+      if (!isDuplicateKeyError(error)) {
+        throw error;
+      }
+
+      await this.disbursementModel.create({
+        batchId: new Types.ObjectId(batchId),
+        tenantId: new Types.ObjectId(tenantId),
+        employeeId: parsed.employeeId,
+        status: DisbursementStatus.INVALID,
+        invalidReason: CROSS_FILE_DUPLICATE_REASON,
+        attempts: 0,
+        lastAttemptAt: null,
+        processedAt: null,
+      });
+      await this.batchModel.findByIdAndUpdate(batchId, { $inc: { invalid: 1 } }).exec();
+      return null;
     }
   }
 

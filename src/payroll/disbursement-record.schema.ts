@@ -61,3 +61,12 @@ DisbursementRecordSchema.index({ tenantId: 1, payPeriod: 1 });
 DisbursementRecordSchema.index({ tenantId: 1, employeeName: 'text' });
 DisbursementRecordSchema.index({ supervisorId: 1, tenantId: 1 });
 DisbursementRecordSchema.index({ batchId: 1 });
+DisbursementRecordSchema.index(
+  { tenantId: 1, employeeId: 1, payPeriod: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      status: { $in: ['PENDING', 'PROCESSING', 'RETRYING', 'SUCCEEDED'] },
+    },
+  },
+);

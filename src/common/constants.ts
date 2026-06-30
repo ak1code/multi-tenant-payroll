@@ -19,6 +19,14 @@ export enum DisbursementStatus {
   INVALID = 'INVALID',
 }
 
+/** Blocks a new disbursement for the same tenant + employee + pay period. */
+export const ACTIVE_DISBURSEMENT_STATUSES = [
+  DisbursementStatus.PENDING,
+  DisbursementStatus.PROCESSING,
+  DisbursementStatus.RETRYING,
+  DisbursementStatus.SUCCEEDED,
+] as const;
+
 export const PAYROLL_QUEUE = 'payroll-disbursement';
 
 export const BCRYPT_SALT_ROUNDS = 12;
