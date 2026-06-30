@@ -18,6 +18,12 @@ External dependencies:
 
 **Swagger UI** is available at `/api/docs` for interactive API testing.
 
+### How components interact
+
+Typical upload flow: **Admin** → `PayrollController` → `PayrollService` (hash file, create batch, validate rows) → **MongoDB** (batches + disbursement records) and **BullMQ/Redis** (one job per valid row) → `PayrollProcessor` worker → `mockDisbursementFunction`. Search and batch-status reads go through the same controller/service layer back to MongoDB. Auth is handled by `AuthModule` before any payroll route runs.
+
+See [docs/flow-diagram.md](docs/flow-diagram.md) for the full upload → queue → worker → success/retry/dead-letter diagram.
+
 ## 2. Queue / Retry / Dead-Letter Design
 
 - Queue name: `payroll-disbursement`
@@ -35,11 +41,21 @@ Current design updates MongoDB per row. At very high scale:
 - Move CSV parsing to a dedicated **`batch-parse` BullMQ job** so parsing survives process restarts
 - Consider **bulk insert** for disbursement records instead of one-at-a-time
 
-## 3. Tenant Isolation
+## 3. Tenant Isolation & Structural Enforcement
 
 Every authenticated request carries `tenantId` in the JWT payload. Services **always** prepend `{ tenantId: user.tenantId }` to MongoDB queries — never relying on client-supplied tenant IDs.
 
-`TenantContext` + `TenantInterceptor` populate request-scoped tenant metadata after JWT validation. **Enforcement is applied in service-layer queries** via `@CurrentUser()` — each payroll method explicitly filters by `user.tenantId` from the signed JWT.
+**Defense layers (tenant + role):**
+
+1. **`JwtAuthGuard`** — unauthenticated requests are rejected before handlers run
+2. **`RolesGuard` + `@Roles()`** — role checked on each payroll endpoint (e.g. upload is Admin-only)
+3. **Service-layer queries** — `user.tenantId` from the signed JWT is always included in MongoDB filters (`getBatchStatus`, `search`, etc.)
+4. **`buildQuery()`** — single method for search filters; adds `supervisorId` when the caller is a Supervisor
+5. **Integration tests** — cross-tenant access and cross-supervisor record access are covered in e2e tests
+
+`TenantInterceptor` sets request-scoped `TenantContext` after JWT validation for potential shared helpers; **today, enforcement lives in explicit service queries** via `@CurrentUser()`.
+
+**What stops a future change from bypassing this?** There is no automatic Mongoose plugin or repository that injects `tenantId` on every query. A new endpoint that omits guards or forgets `tenantId` in a query could leak data. Mitigation: convention (always use guards + `@CurrentUser()`), centralized `buildQuery()` for search, and tests that fail if scoping regresses. A shared tenant-scoped repository would be the next hardening step.
 
 ## 4. Authentication & Refresh Tokens
 
@@ -54,13 +70,15 @@ Passwords use bcrypt; refresh token hashes use SHA-256 (bcrypt truncates inputs 
 
 ## 5. Role Scoping
 
+Role rules are enforced structurally via `RolesGuard` and `@Roles()` (see §3). Endpoint access:
+
 | Role | Upload | Batch Status | Search |
 |---|---|---|---|
 | ADMIN | Yes | Yes | All tenant records |
 | HR | No | Yes | All tenant records |
 | SUPERVISOR | No | No | Only records where `supervisorId === user._id` |
 
-Supervisor scoping uses **denormalized `supervisorId`** on `DisbursementRecord` (copied from Employee at write time) — avoids joins on every search query.
+Supervisor scoping uses **denormalized `supervisorId`** on `DisbursementRecord` (copied from Employee at write time) — avoids joins on every search query. The filter is applied inside `buildQuery()`, not repeated per endpoint.
 
 ## 6. Idempotency Strategy
 
@@ -69,7 +87,7 @@ Supervisor scoping uses **denormalized `supervisorId`** on `DisbursementRecord` 
 3. Duplicate upload → MongoDB E11000 → API returns **409 Conflict** — no rows are parsed, no jobs enqueued, and no disbursements run (duplicate **processing** prevented, not just duplicate batch storage)
 4. Concurrent duplicate uploads race on the unique index — only one batch is created
 5. **Within-file dedup:** duplicate `employeeId + payPeriod` in the same CSV are marked `INVALID` and never queued
-6. **Cross-file dedup:** the same `tenantId + employeeId + payPeriod` is rejected when a prior disbursement is `SUCCEEDED` or in-flight (`PENDING` / `PROCESSING` / `RETRYING`). Rows are marked `INVALID` with a clear reason — no second queue job or disbursement call. Retries are allowed after `DEAD_LETTER` or `INVALID` (e.g. admin uploads a corrected file). A **partial unique MongoDB index** on `{ tenantId, employeeId, payPeriod }` for active/success statuses prevents race duplicates when two different files are uploaded concurrently
+6. **Cross-file dedup:** the same `tenantId + employeeId + payPeriod` is rejected when a prior disbursement is `SUCCEEDED` or in-flight (`PENDING` / `PROCESSING` / `RETRYING`). Rows are marked `INVALID` with a clear reason — no second queue job or disbursement call. Retries are allowed after `DEAD_LETTERED` or `INVALID` (e.g. admin uploads a corrected file). A **partial unique MongoDB index** on `{ tenantId, employeeId, payPeriod }` for active/success statuses prevents race duplicates when two different files are uploaded concurrently
 
 ## 7. Indexing Decisions
 
@@ -103,4 +121,7 @@ For real-time infinite scroll at scale, cursor-based pagination on `_id` + filte
 - Batch counters updated per-row in MongoDB — at very high scale, use Redis counters
 - No rate limiting on upload endpoint (would add in production)
 - No email/webhook notification on batch completion
+- **No payment reversal** — cross-file dedup blocks re-pay for `SUCCEEDED` rows; correcting an amount requires a void/reversal workflow (out of scope)
+- **Global `fileHash` index** — identical file bytes cannot be uploaded twice even across tenants (stricter than per-tenant; acceptable for this assignment)
+- **Byte-level idempotency only for exact re-upload** — same payroll in a reordered or reformatted CSV is treated as a new file; overlapping rows are still blocked by cross-file `employeeId + payPeriod` dedup (§6.6)
 - `enableShutdownHooks()` registered for graceful BullMQ worker shutdown on SIGTERM
